@@ -2,8 +2,6 @@
 """
 import pyparsing as pp
 import netaddr
-from functools import reduce
-from operator import and_, or_
 
 from ovs.flow.decoders import (
     decode_default,
@@ -81,13 +79,9 @@ class ClauseExpression(object):
     }
 
     def __init__(self, tokens):
-        self.field = tokens[0]
-        self.value = ""
-        self.operator = ""
-
-        if len(tokens) > 1:
-            self.operator = tokens[1]
-            self.value = tokens[2]
+        self.field = tokens.field
+        self.operator = tokens.op
+        self.value = tokens.value
 
     def __repr__(self):
         return "{}(field: {}, operator: {}, value: {})".format(
@@ -172,6 +166,8 @@ class ClauseExpression(object):
 
         if self.operator == "=":
             return EvaluationResult(decoded_value == data, keyval)
+        elif self.operator == "!=":
+            return EvaluationResult(decoded_value != data, keyval)
         elif self.operator == "<":
             return EvaluationResult(data < decoded_value, keyval)
         elif self.operator == ">":
@@ -199,7 +195,8 @@ class BoolAnd(object):
         return "AND({})".format(self.args)
 
     def evaluate(self, flow):
-        return reduce(and_, [arg.evaluate(flow) for arg in self.args])
+        # return reduce(and_, [arg.evaluate(flow) for arg in self.args])
+        return all(arg.evaluate(flow) for arg in self.args)
 
 
 class BoolOr(object):
@@ -207,7 +204,8 @@ class BoolOr(object):
         self.args = pattern[0][0::2]
 
     def evaluate(self, flow):
-        return reduce(or_, [arg.evaluate(flow) for arg in self.args])
+        # return reduce(or_, [arg.evaluate(flow) for arg in self.args])
+        return any(arg.evaluate(flow) for arg in self.args)
 
     def __repr__(self):
         return "OR({})".format(self.args)
@@ -222,32 +220,43 @@ class OFFilter(object):
     Args:
         expr(str): String filter expression.
     """
-    w = pp.Word(pp.alphanums + "." + ":" + "_" + "/" + "-")
-    operators = (
-        pp.Literal("=")
-        | pp.Literal("~=")
-        | pp.Literal("<")
-        | pp.Literal(">")
-        | pp.Literal("!=")
-    )
+    w = pp.Word(pp.alphanums + ".:_/-")
+    operator = pp.one_of("= ~= < > !=")
+    clause = pp.Group(w("field") + pp.Optional(operator("op") + w("value")))
 
-    clause = (w + operators + w) | w
-    clause.setParseAction(ClauseExpression)
+    # a more specific parser, will catch errors in malformed field names and values
+    # use of pp.common.number will do parse-time conversion from str to int or float
+    #
+    # ident = pp.common.identifier()
+    # field = pp.Combine(ident + pp.Optional("." + ident))
+    # ip_address = pp.common.ipv4_address() | pp.common.ipv6_address()
+    # value = ip_address | pp.common.number() | pp.QuotedString('"') | pp.QuotedString("'")
+    # clause = pp.Group(field("field") + pp.Optional(operator("op") - value("value")))
 
-    statement = pp.infixNotation(
+    clause.set_parse_action(ClauseExpression)
+
+    # collapsing these operands down has performance and behavioral benefits
+    # - fewer levels in infixNotation will be faster
+    # - ! and `not` will get treated at the save level of precedence, instead of
+    #   artificially evaluating ! before `not`
+    # making operators caseless keywords will allow uppercase operators also, and
+    # will prevent confusing longer named terms for operators (parsing the leading
+    # "not" of "notable")
+    not_op = "!" | pp.CaselessKeyword("not")
+    and_op = "&&" | pp.CaselessKeyword("and")
+    or_op = "||" | pp.CaselessKeyword("or")
+
+    statement = pp.infix_notation(
         clause,
         [
-            ("!", 1, pp.opAssoc.RIGHT, BoolNot),
-            ("not", 1, pp.opAssoc.RIGHT, BoolNot),
-            ("&&", 2, pp.opAssoc.LEFT, BoolAnd),
-            ("and", 2, pp.opAssoc.LEFT, BoolAnd),
-            ("||", 2, pp.opAssoc.LEFT, BoolOr),
-            ("or", 2, pp.opAssoc.LEFT, BoolOr),
+            (not_op, 1, pp.opAssoc.RIGHT, BoolNot),
+            (and_op, 2, pp.opAssoc.LEFT, BoolAnd),
+            (or_op, 2, pp.opAssoc.LEFT, BoolOr),
         ],
     )
 
     def __init__(self, expr):
-        self._filter = self.statement.parseString(expr)
+        self._filter = self.statement.parse_string(expr)
 
     def evaluate(self, flow):
         """Evaluate whether the flow satisfies the filter.
